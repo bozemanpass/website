@@ -1,0 +1,299 @@
+*** original/malloc.c	Thu Jul 18 09:50:39 2002
+--- patched/malloc.c	Mon Jul 29 09:38:00 2002
+***************
+*** 20,24 ****
+     02111-1307 USA.  */
+  
+! /* $Id: malloc.c,v 1.87 2001/09/19 03:23:27 drepper Exp $
+  
+    This work is mainly derived from malloc-2.6.4 by Doug Lea
+--- 20,24 ----
+     02111-1307 USA.  */
+  
+! /* $Id: malloc.c,v 1.87 2001/09/19 03:23:27 drepper Exp $ 
+  
+    This work is mainly derived from malloc-2.6.4 by Doug Lea
+***************
+*** 852,855 ****
+--- 852,863 ----
+     computed. */
+  
++ #define USE_FREE_QUEUE 1
++ #ifndef USE_FREE_QUEUE
++ #define USE_FREE_QUEUE 0
++ #else
++ #include <asm/atomic.h>
++ #define FREE_QUEUE_SIZE 16 /* DBDB Need to check that this isn't > word size */
++ #endif
++ 
+  
+  /* Macro to set errno.  */
+***************
+*** 1214,1217 ****
+--- 1222,1233 ----
+  #endif
+    mutex_t mutex;
++ #if USE_FREE_QUEUE
++ #if THREAD_STATS
++   atomic_t stat_lock_queue; /* Count when we enqueue on the free queue */
++   long stat_lock_block;   /* Count when we block in free */
++ #endif
++   long int free_queue_bitmap;
++   mchunkptr free_queue[FREE_QUEUE_SIZE];
++ #endif
+  } arena;
+  
+***************
+*** 1247,1250 ****
+--- 1263,1270 ----
+  #if USE_ARENAS
+  static int       heap_trim(heap_info *heap, size_t pad) internal_function;
++ #if USE_FREE_QUEUE
++ static void queued_blocks_free(arena *ar_ptr) internal_function;
++ static int queue_block_pending_free(arena *ar_ptr, mchunkptr p) internal_function;
++ #endif
+  #endif
+  #if defined _LIBC || defined MALLOC_HOOKS
+***************
+*** 1272,1275 ****
+--- 1292,1299 ----
+  #if USE_ARENAS
+  static int       heap_trim();
++ #if USE_FREE_QUEUE
++ static void queued_blocks_free();
++ static int queue_block_pending_free();
++ #endif
+  #endif
+  #if defined _LIBC || defined MALLOC_HOOKS
+***************
+*** 1532,1535 ****
+--- 1556,1568 ----
+  #endif
+      MUTEX_INITIALIZER /* mutex */
++ #if USE_FREE_QUEUE
++     ,
++ #if THREAD_STATS
++     ATOMIC_INIT(0) , /* stat_lock_queue */
++     0 , /* stat_lock_block */
++ #endif
++     0 , /* free_queue_bitmap */
++     {0} /* free_queue[FREE_QUEUE_SIZE] */
++ #endif /* USE_THREAD_QUEUE */
+  };
+  
+***************
+*** 2829,2837 ****
+      }
+      if(!victim) return 0;
+!   } else
+!     (void)mutex_unlock(&ar_ptr->mutex);
+    return BOUNDED_N(chunk2mem(victim), bytes);
+  }
+  
+  static mchunkptr
+  internal_function
+--- 2862,2929 ----
+      }
+      if(!victim) return 0;
+!   } else {
+! #if USE_FREE_QUEUE
+! 	  if (ar_ptr->free_queue_bitmap) {
+!         queued_blocks_free(ar_ptr); /* free anything in the queue */
+! 	  }
+! #endif
+!       (void)mutex_unlock(&ar_ptr->mutex);
+!     }
+    return BOUNDED_N(chunk2mem(victim), bytes);
+  }
+  
++ #if USE_FREE_QUEUE
++ 
++ /* We should call the __compare_and_swap function in libpthread,
++    but that is not a public symbol. Until we resolve how to cleanly
++    call that function, we paste the IA-32 source code in here.
++  */
++ 
++ static int
++ __compare_and_swap (long int *p, long int oldval, long int newval)
++ {
++   char ret;
++   long int readval;
++ 
++   __asm__ __volatile__ ("lock; cmpxchgl %3, %1; sete %0"
++ 			: "=q" (ret), "=m" (*p), "=a" (readval)
++ 			: "r" (newval), "m" (*p), "a" (oldval)
++ 			: "memory");
++   return ret;
++ }
++ 
++ 
++ static void
++ internal_function
++ #if __STD_C
++ queued_blocks_free(arena *ar_ptr)
++ #else
++ queued_blocks_free(ar_ptr) arena *ar_ptr;
++ #endif
++ {
++   long int *queue_word = &(ar_ptr->free_queue_bitmap);
++   long int queue_value;
++   int target_bitmask;
++   int i = 0;
++   /* This function must only be called while the arena lock is held */
++   /* Walk along the queue freeing anything we find and clearing its bit in the flag word */
++   while (i < FREE_QUEUE_SIZE) {
++ 	queue_value = *queue_word;
++     target_bitmask = 1<<i;
++     if ( (0 != (queue_value & target_bitmask)) && ar_ptr->free_queue[i]) {
++ 
++       chunk_free(ar_ptr, (ar_ptr->free_queue)[i] );
++       (ar_ptr->free_queue)[i] = NULL;
++ 
++ 	  /* Reset the bit for this queue entry, indicating that we have finished using it */
++       while (!__compare_and_swap(queue_word, queue_value, queue_value & ~target_bitmask )) {
++ 		queue_value = *queue_word;
++       }
++     }
++     i++;
++   }
++ }
++ #endif
++ 
+  static mchunkptr
+  internal_function
+***************
+*** 3142,3159 ****
+  
+    ar_ptr = arena_for_ptr(p);
+  #if THREAD_STATS
+-   if(!mutex_trylock(&ar_ptr->mutex))
+      ++(ar_ptr->stat_lock_direct);
+    else {
+!     (void)mutex_lock(&ar_ptr->mutex);
+      ++(ar_ptr->stat_lock_wait);
+    }
+- #else
+-   (void)mutex_lock(&ar_ptr->mutex);
+  #endif
+    chunk_free(ar_ptr, p);
+    (void)mutex_unlock(&ar_ptr->mutex);
+  }
+  
+  static void
+  internal_function
+--- 3234,3311 ----
+  
+    ar_ptr = arena_for_ptr(p);
++ 
++   if(!mutex_trylock(&ar_ptr->mutex)) {
+  #if THREAD_STATS
+      ++(ar_ptr->stat_lock_direct);
++ #endif
++   /* We aquired the lock first time */
++   ; 
++   }
+    else {
+! #if USE_FREE_QUEUE
+!     /* Couldn't get the lock, try to queue the block for later */
+!     if (queue_block_pending_free(ar_ptr, p)) {
+! #if THREAD_STATS
+!       atomic_inc(&(ar_ptr->stat_lock_queue));
+! #endif
+! 		return; /* Once we have queued the block, we are done */
+!     } else {
+! #endif /* USE_FREE_QUEUE */
+!       /* Couldn't queue either, so we have no option but to block... */
+!       (void)mutex_lock(&ar_ptr->mutex);
+! #if THREAD_STATS
+! #if USE_FREE_QUEUE
+!     ++(ar_ptr->stat_lock_block);
+! #else
+      ++(ar_ptr->stat_lock_wait);
++ #endif /* USE_FREE_QUEUE */
++ #endif
++     }
++ #if USE_FREE_QUEUE
+    }
+  #endif
+    chunk_free(ar_ptr, p);
++ #if USE_FREE_QUEUE
++   /* Free anything pending on the queue while we hold the lock */
++   if (ar_ptr->free_queue_bitmap) {
++     queued_blocks_free(ar_ptr);
++   }
++ #endif
+    (void)mutex_unlock(&ar_ptr->mutex);
+  }
+  
++ #if USE_FREE_QUEUE
++ 
++ static int
++ internal_function
++ #if __STD_C
++ queue_block_pending_free(arena *ar_ptr, mchunkptr p) 
++ #else
++ queue_block_pending_free(ar_ptr, p) arena *ar_ptr; mchunkptr p;
++ #endif
++ {
++   long int *queue_word = &(ar_ptr->free_queue_bitmap);
++   long int queue_value = *queue_word;
++   int target_bitmask;
++   int i = 0;
++ 
++   /* Find first bit clear */
++   while (i < FREE_QUEUE_SIZE) {
++     target_bitmask = 1<<i;
++     if (0 == (queue_value & target_bitmask) ) {
++       /* No occupier in this queue slot currently, try to take posession */
++       if (__compare_and_swap(queue_word, queue_value, queue_value | target_bitmask )) {
++         /* We got it, store the pointer and we're done */
++ 	ar_ptr->free_queue[i] = p;
++ 	return 1;
++       }
++     }
++     i++;
++ 	queue_value = *queue_word;
++   }
++   return 0;
++ }
++ #endif
++ 
+  static void
+  internal_function
+***************
+*** 4216,4219 ****
+--- 4368,4374 ----
+  #if THREAD_STATS
+    long stat_lock_direct = 0, stat_lock_loop = 0, stat_lock_wait = 0;
++ #if USE_FREE_QUEUE
++   long stat_lock_queue = 0, stat_lock_block = 0;
++ #endif
+  #endif
+  
+***************
+*** 4229,4232 ****
+--- 4384,4391 ----
+      stat_lock_loop += ar_ptr->stat_lock_loop;
+      stat_lock_wait += ar_ptr->stat_lock_wait;
++ #if USE_FREE_QUEUE
++     stat_lock_queue += atomic_read(&(ar_ptr->stat_lock_queue));
++     stat_lock_block += ar_ptr->stat_lock_block;
++ #endif
+  #endif
+  #if USE_ARENAS && MALLOC_DEBUG > 1
+***************
+*** 4261,4266 ****
+--- 4420,4432 ----
+    fprintf(stderr, "locked in loop   = %10ld\n", stat_lock_loop);
+    fprintf(stderr, "locked waiting   = %10ld\n", stat_lock_wait);
++ #if USE_FREE_QUEUE
++   fprintf(stderr, "frees to queue   = %10ld\n", stat_lock_queue);
++   fprintf(stderr, "frees blocked    = %10ld\n", stat_lock_block);
++   fprintf(stderr, "locked total     = %10ld\n",
++           stat_lock_direct + stat_lock_loop + stat_lock_wait + stat_lock_queue + stat_lock_block);
++ #else
+    fprintf(stderr, "locked total     = %10ld\n",
+            stat_lock_direct + stat_lock_loop + stat_lock_wait);
++ #endif /* USE_FREE_QUEUE */
+  #endif
+  }
